@@ -4,7 +4,7 @@
 3.1. В Url-строку браузера ввести IP-адрес дрона.
 3.2. Проверить отображение ArUco map (пункт 1).
 3.3. Перейти в (пароль: raspberry)
-3.4. cd skyros/tests nano banana.py 
+3.4. cd skyros/tests nano swarm_of_drone.py 
 3.5. Отредактировать код (если требуется).
 3.6. Выйти (ctrl + x), сохранить изменения (Y), enter.
-4. Перенести дрон в зону полета. 4.1. python3 banana.py
+4. Перенести дрон в зону полета. 4.1. python3 swarm_of_drone.py
