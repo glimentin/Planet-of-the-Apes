@@ -1,0 +1,147 @@
+import logging
+import pathlib
+import sys
+import requests
+import time
+
+import rospy
+from clover.srv import SetLEDEffect
+
+from skyros.drone import Drone
+
+# Initialize logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+# Initialize drone
+peer = Drone(pathlib.Path(__file__).parent / "zenoh-config.json5")
+peer.logger.setLevel(logging.INFO)
+peer.logger.addHandler(logging.StreamHandler(stream=sys.stdout))
+rospy.init_node(peer.name)
+set_effect = rospy.ServiceProxy('led/set_effect', SetLEDEffect)
+
+# Base URL for sheep coordinates
+base_url = "http://192.168.2.108:5000"  # Убедитесь, что IP и порт верны!
+
+def get_s_element():
+    try:
+        # Запрашиваем данные с /coord
+        response = requests.get(f"{base_url}/coord", timeout=3)
+        response.raise_for_status()  # Проверка на ошибки
+        
+        # Разбиваем строку по ';' и берём последний элемент
+        coord_data = response.text.strip()  # "150:G8;151:E8;...;S:H1"
+        s_element = coord_data.split(';')[-1]  # "S:H1"
+        
+        # Проверяем, что элемент начинается с "S:"
+        if s_element.startswith("S:"):
+            return s_element[2:]  # Возвращаем только координаты, например, "H1"
+        return None
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Ошибка запроса: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка обработки: {e}")
+        return None
+
+def chess_to_drone_coords(chess_coord):
+    """
+    Преобразует шахматные координаты (например, 'C5') в координаты дронов (x, y) на поле 3x3 метра.
+    
+    Args:
+        chess_coord (str): Шахматные координаты, например, 'C5'.
+    
+    Returns:
+        tuple: Кортеж (x, y) в метрах или None, если координаты некорректны.
+    """
+    try:
+        # Извлекаем букву и цифру (например, 'C5' → 'C', '5')
+        letter = chess_coord[0].upper()
+        number = int(chess_coord[1])
+        
+        # Проверяем валидность
+        if letter not in 'ABCDEFGH' or number < 1 or number > 8:
+            logger.error(f"Ошибка: Некорректные координаты {chess_coord}")
+            return None
+        
+        # Маппинг букв A-H на x: от -1.36 (A) до 1.115 (H), шаг 0.375
+        letter_map = {
+            'A': -1.36,
+            'B': -1.36 + 0.375,
+            'C': -1.36 + 2 * 0.375,
+            'D': -1.36 + 3 * 0.375,
+            'E': -1.36 + 4 * 0.375,
+            'F': -1.36 + 5 * 0.375,
+            'G': -1.36 + 6 * 0.375,
+            'H': -1.36 + 7 * 0.375
+        }
+        x = letter_map[letter]
+        
+        # Маппинг цифр 1-8 на y: от 1.36 (1) до -1.115 (8), шаг -0.375
+        y = 1.36 - (number - 1) * 0.375
+        
+        return (x, y)
+    except (KeyError, ValueError, IndexError) as e:
+        logger.error(f"Ошибка преобразования координат {chess_coord}: {e}")
+        return None
+
+with peer:
+    logger.info("Drone started...")
+    logger.info("Waiting for other drones...")
+    peer.wait_for_peer_amount(3)  # Wait for at least one other drone
+    logger.info(f"Connected peers: {peer.get_peers()}")
+
+    # Take off
+    peer.takeoff(z=1.5, delay=0)
+    peer.wait(2.5)
+
+    try:
+        # Проверяем координаты овцы
+        s_data = get_s_element()
+        if s_data:
+            logger.info(f"Найдена овца: {s_data}")
+            # Преобразуем координаты овцы
+            coords = chess_to_drone_coords(s_data)
+            if coords:
+                x_sheep, y_sheep = coords
+                z = 1.5  # Фиксированная высота
+
+                # Позиции для посадки вокруг овцы (4 точки на расстоянии 0.5 м)
+                landing_positions = [
+                    (x_sheep + 0.5, y_sheep, z),  # Справа
+                    (x_sheep - 0.5, y_sheep, z),  # Слева
+                    (x_sheep, y_sheep + 0.5, z),  # Сверху
+                    (x_sheep, y_sheep - 0.5, z)   # Снизу
+                ]
+
+                # Для одного дрона выбираем первую позицию
+                x, y, z = landing_positions[0]
+                logger.info(f"Наводимся к точке около овцы: ({x}, {y}, {z})")
+                peer.navigate_with_avoidance(x=x, y=y, z=z, frame_id="aruco_map", timeout=20.0)
+                peer.wait(2)
+
+                # Мигаем светодиодами
+                set_effect(effect='blink', r=0, g=0, b=255)  # Синий
+                rospy.sleep(0.5)
+                set_effect(effect='blink', r=255, g=0, b=0)  # Красный
+                rospy.sleep(0.5)
+                set_effect(effect='blink', r=0, g=0, b=255)  # Синий
+                rospy.sleep(0.5)
+                set_effect(effect='blink', r=255, g=0, b=0)  # Красный
+                rospy.sleep(0.5)
+                set_effect(effect='blink', r=0, g=0, b=255)  # Синий
+                rospy.sleep(0.5)
+
+                # Приземляемся
+                peer.land()
+            else:
+                logger.error("Не удалось преобразовать координаты овцы, посадка...")
+                peer.land()
+        else:
+            logger.info("Овца не найдена, посадка...")
+            peer.land()
+
+    except Exception as e:
+        logger.error(f"Ошибка во время полёта: {e}")
+        peer.land()
