@@ -1,0 +1,111 @@
+import logging
+import pathlib
+import sys
+import requests
+import rospy
+from clover.srv import SetLEDEffect
+from skyros.drone import Drone
+
+# Initialize logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+# Function to parse drone coordinates from webpage
+def parse_drone_coordinates(url, drone_id):
+    """
+    Парсит веб-страницу и возвращает смещение (dx, dy) для указанного drone_id.
+    
+    :param url: URL веб-страницы с данными в формате 'ID:dx,dy;ID:dx,dy;...'
+    :param drone_id: ID текущего дрона (строка или число)
+    :return: Кортеж (dx, dy) в сантиметрах или None, если данные не найдены
+    """
+    try:
+        response = requests.get(url, timeout=5)
+        response.raise_for_status()  # Проверка на ошибки HTTP
+        data = response.text.strip()  # Получаем текст страницы, убираем пробелы
+        logger.info(f"Получены данные с веб-страницы: {data}")
+
+        # Разделяем строку на записи для каждого дрона
+        entries = data.split(';')
+        for entry in entries:
+            if not entry:
+                continue
+            drone_id_str, coords = entry.split(':')
+            if drone_id_str == str(drone_id):
+                dx, dy = map(int, coords.split(','))
+                # Переводим смещения в сантиметры (1 клетка = 40 см)
+                return (dx * 40, dy * 40)
+        logger.warning(f"Данные для дрона {drone_id} не найдены")
+        return None
+    except requests.RequestException as e:
+        logger.error(f"Ошибка при запросе веб-страницы: {e}")
+        return None
+    except ValueError as e:
+        logger.error(f"Ошибка парсинга данных: {e}")
+        return None
+
+# Initialize drone
+peer = Drone(pathlib.Path(__file__).parent / "zenoh-config.json5")
+peer.logger.setLevel(logging.INFO)
+peer.logger.addHandler(logging.StreamHandler(stream=sys.stdout))
+rospy.init_node(peer.name)
+set_effect = rospy.ServiceProxy('led/set_effect', SetLEDEffect)
+
+# URL веб-страницы (замените на реальный URL)
+WEBPAGE_URL = "http://example.com/drone_coords"  # Укажите реальный URL
+DRONE_ID = peer.name  # Предполагаем, что ID дрона доступен через peer.name
+
+with peer:
+    logger.info("Drone started...")
+    logger.info("Waiting for other drones...")
+    peer.wait_for_peer_amount(1)  # Wait for at least one other drone
+    logger.info(f"Connected peers: {peer.get_peers()}")
+
+    # Take off
+    peer.takeoff(z=1.5, delay=7.5)
+    peer.wait(2.5)
+
+    # Get initial position
+    current_x, current_y = 0.0, 0.0  # Начальные координаты в метрах (можно уточнить)
+    x_start, y_start, z_start = current_x, current_y, 1.5
+
+    try:
+        # Navigate to initial position
+        peer.navigate_wait(x=x_start, y=y_start, z=z_start, frame_id="aruco_map")
+        set_effect(r=255, g=0, b=0)  # Red color for start
+        rospy.sleep(0.5)
+        set_effect(r=0, g=100, b=0)  # Green color for navigation start
+        rospy.sleep(0.4)
+
+        # Main loop: parse webpage and move
+        while not rospy.is_shutdown():
+            # Получаем смещения с веб-страницы
+            offsets = parse_drone_coordinates(WEBPAGE_URL, DRONE_ID)
+            if offsets:
+                dx, dy = offsets
+                # Проверяем, что dy соответствует движению вперёд (+40 см)
+                if dy != 40:
+                    logger.warning(f"Недопустимое значение dy={dy}, ожидается +40 см")
+                    continue
+                
+                # Вычисляем новую позицию
+                new_x = current_x + dx / 100.0  # Переводим см в метры
+                new_y = current_y + dy / 100.0
+                logger.info(f"Дрон {DRONE_ID} перемещается в ({new_x}, {new_y}, 1.5)")
+
+                # Проверяем границы поля (8x8 клеток, 0–280 см)
+                if 0 <= new_x * 100 <= 280 and 0 <= new_y * 100 <= 280:
+                    peer.navigate_with_avoidance(x=new_x, y=new_y, z=1.5, frame_id="aruco_map", timeout=20.0)
+                    current_x, current_y = new_x, new_y  # Обновляем текущую позицию
+                    peer.wait(1)
+                else:
+                    logger.warning(f"Новая позиция ({new_x}, {new_y}) за пределами поля")
+            else:
+                logger.info("Ожидание новых данных с веб-страницы...")
+                rospy.sleep(1)  # Пауза перед следующим запросом
+
+    finally:
+        # Return to start and land
+        peer.navigate_wait(x=x_start, y=y_start, z=1.0, frame_id="aruco_map")
+        set_effect(r=0, g=0, b=255)  # Blue color for landing
+        peer.land()
